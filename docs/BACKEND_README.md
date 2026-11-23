@@ -6,6 +6,8 @@ This repo also defines the protocol buffer schemas for Flyte's APIs and generate
 
 **Want to contribute?** Join us on [slack.flyte.org](https://slack.flyte.org) to get involved.
 
+For project and domain namespace placement, see [Run namespaces](namespace-mapping.md).
+
 ## Repository Structure
 
 ```
@@ -33,7 +35,7 @@ flyte/
 ## Prerequisites
 
 - [Buf CLI](https://buf.build/docs/installation) - Protocol buffer tooling
-- Go 1.27.3 or later
+- Go 1.27.4 or later
 - Node.js/npm (for TypeScript generation)
 - Python 3.9+ with `uv` package manager (for Python generation)
 - Rust toolchain (for Rust generation)
@@ -152,7 +154,7 @@ The `gen/` directory contains auto-generated code and should not be manually edi
 
 ### Go Module Issues
 - Run `make go-tidy` to clean up dependencies
-- Ensure you're using Go 1.27.3 or later
+- Ensure you're using Go 1.27.4 or later
 
 ### Python Generation Issues
 - Ensure `uv` is installed: `pip install uv`

@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"connectrpc.com/connect"
 	"github.com/stretchr/testify/assert"
@@ -33,7 +37,9 @@ func newTaskClient(t *testing.T, funcs *interceptor.Funcs) *ActionsClient {
 	require.NoError(t, corev1.AddToScheme(scheme)) // EnsureNamespaceExists needs v1.Namespace
 	require.NoError(t, executorv1.AddToScheme(scheme))
 	parent := &executorv1.TaskAction{
-		ObjectMeta: metav1.ObjectMeta{Name: "run1-a0", Namespace: "flyte"},
+		ObjectMeta: metav1.ObjectMeta{Name: "run1-a0", Namespace: "flyte", Labels: map[string]string{
+			"flyte.org/project": "proj", "flyte.org/domain": "dev", "flyte.org/run": "run1",
+		}},
 	}
 	builder := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -118,6 +124,10 @@ func TestEnqueueTask_CreateError(t *testing.T) {
 			c := newTaskClient(t, &interceptor.Funcs{
 				Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 					if _, ok := obj.(*executorv1.TaskAction); ok {
+						if apierrors.IsAlreadyExists(tc.createErr) {
+							// Model another replica winning creation before this request.
+							require.NoError(t, cl.Create(ctx, obj, opts...))
+						}
 						return tc.createErr
 					}
 					return cl.Create(ctx, obj, opts...)
@@ -127,6 +137,54 @@ func TestEnqueueTask_CreateError(t *testing.T) {
 			err := c.Enqueue(context.Background(), newChildTaskAction(), nil)
 			require.Error(t, err)
 			tc.check(t, err)
+		})
+	}
+}
+
+// Children are enqueued without a RunSpec, so the start time must survive in
+// the parent CR and propagate through every generation.
+func TestEnqueueTask_InheritsRunStartTime(t *testing.T) {
+	for _, withStartTime := range []bool{true, false} {
+		name := "legacy run without start time"
+		if withStartTime {
+			name = "run with start time"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			c := newTaskClient(t, nil)
+			runSpec := &task.RunSpec{}
+			expected := runStartTimeTemplateVar
+			if withStartTime {
+				runSpec.RunStartTime = timestamppb.New(time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC))
+				expected = "2026-06-03T12:00:00Z"
+			}
+			parent := ""
+			for _, actionName := range []string{"root", "child", "grandchild"} {
+				action := newChildTaskAction()
+				action.ActionId.Name = actionName
+				action.ParentActionName = &parent
+				tmpl := action.GetTask().GetSpec().GetTaskTemplate()
+				tmpl.Target = &core.TaskTemplate_Container{Container: &core.Container{
+					Args: []string{"--run-start-time", runStartTimeTemplateVar},
+				}}
+				var spec *task.RunSpec
+				if parent == "" {
+					spec = runSpec
+				}
+				require.NoError(t, c.Enqueue(ctx, action, spec))
+				created, err := c.GetTaskAction(ctx, action.ActionId)
+				require.NoError(t, err)
+				embedded := &core.TaskTemplate{}
+				require.NoError(t, proto.Unmarshal(created.Spec.TaskTemplate, embedded))
+				assert.Equal(t, []string{"--run-start-time", expected}, embedded.GetContainer().GetArgs())
+				assert.Equal(t, runStartTimeTemplateVar, tmpl.GetContainer().GetArgs()[1])
+				if withStartTime {
+					assert.Equal(t, expected, created.Spec.RunStartTime)
+				} else {
+					assert.Empty(t, created.Spec.RunStartTime)
+				}
+				parent = actionName
+			}
 		})
 	}
 }

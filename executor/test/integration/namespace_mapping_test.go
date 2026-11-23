@@ -17,19 +17,20 @@ limitations under the License.
 package integration
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric/noop"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	actionsk8s "github.com/flyteorg/flyte/v2/actions/k8s"
 	flyteorgv1 "github.com/flyteorg/flyte/v2/executor/api/v1"
-	"github.com/flyteorg/flyte/v2/flytestdlib/promutils"
+	"github.com/flyteorg/flyte/v2/flytestdlib/fastcheck"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/common"
 )
 
@@ -40,8 +41,9 @@ import (
 func TestEnqueueReconcile_MappedNamespace(t *testing.T) {
 	// Enqueue through a client with the mapping; the suite's actionsClient keeps
 	// watching every namespace through the shared cache.
-	mappedClient, err := actionsk8s.NewActionsClient(k8sClient, sharedCache, "flyte", 32, 1, runClient, 1024,
-		promutils.NewScope(fmt.Sprintf("integration_actions_mapped_%d", time.Now().UnixNano())),
+	recordedFilter, err := fastcheck.NewOppoBloomFilter(1024, "integration_actions_mapped", noop.NewMeterProvider())
+	require.NoError(t, err)
+	mappedClient, err := actionsk8s.NewActionsClient(k8sClient, sharedCache, "flyte", 32, 1, runClient, recordedFilter,
 		"{{ project }}-{{ domain }}", true)
 	require.NoError(t, err)
 
@@ -91,4 +93,45 @@ func TestEnqueueReconcile_MappedNamespace(t *testing.T) {
 		}
 		return false
 	}, 15*time.Second, 200*time.Millisecond, "RecordAction should reach the internal run service")
+}
+
+func TestNamespaceMappingChangeDoesNotMoveRunningTasks(t *testing.T) {
+	for _, template := range []string{"v2-{{ project }}-{{ domain }}", ""} {
+		t.Run(template, func(t *testing.T) {
+			newClient := func(template string) *actionsk8s.ActionsClient {
+				filter, err := fastcheck.NewOppoBloomFilter(1024, "namespace_change", noop.NewMeterProvider())
+				require.NoError(t, err)
+				c, err := actionsk8s.NewActionsClient(k8sClient, sharedCache, "flyte", 32, 1, runClient, filter, template, true)
+				require.NoError(t, err)
+				return c
+			}
+			runID := &common.RunIdentifier{Org: "test-org", Project: "mapped-change", Domain: "development", Name: uniqueRunName("ns-change")}
+			original := newClient("{{ project }}-{{ domain }}")
+			require.NoError(t, original.Enqueue(ctx, newRootTaskAction(runID), nil))
+			// A fresh client models a deployment that changed or removed the template.
+			restarted := newClient(template)
+			rootID := &common.ActionIdentifier{Run: runID, Name: runID.Name}
+			root, err := restarted.GetTaskAction(ctx, rootID)
+			require.NoError(t, err)
+			require.Equal(t, "mapped-change-development", root.Namespace)
+			child := newRootTaskAction(runID)
+			child.ActionId.Name = "child"
+			child.ParentActionName = &runID.Name
+			require.NoError(t, restarted.Enqueue(ctx, child, nil))
+			childKey := types.NamespacedName{Namespace: root.Namespace, Name: runID.Name + "-child"}
+			for i := 0; i < 2; i++ {
+				_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: childKey})
+				require.NoError(t, err)
+			}
+			pod := &corev1.Pod{}
+			require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: root.Namespace, Name: childKey.Name + "-0"}, pod))
+			require.Eventually(t, func() bool {
+				children, err := restarted.ListChildActions(ctx, rootID)
+				return err == nil && len(children) == 2
+			}, 10*time.Second, 100*time.Millisecond)
+			err = restarted.Enqueue(ctx, newRootTaskAction(runID), nil)
+			require.Equal(t, connect.CodeAlreadyExists, connect.CodeOf(err))
+			require.NoError(t, restarted.AbortAction(ctx, rootID, nil))
+		})
+	}
 }

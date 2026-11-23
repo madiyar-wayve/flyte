@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -957,6 +958,32 @@ func TestListRuns_LabelsFromRunSpec(t *testing.T) {
 	assert.Equal(t, map[string]string{"example.com/job-id": "j-1"}, got.Msg.Runs[0].GetLabels())
 }
 
+// TestListRuns_Annotations verifies a run is listed with the annotations in its run spec.
+func TestListRuns_Annotations(t *testing.T) {
+	actionRepo, _, svc := newTestService(t)
+
+	runSpec, err := proto.Marshal(&task.RunSpec{
+		Annotations: &task.Annotations{Values: map[string]string{"example.com/branch": "feat/x"}},
+	})
+	require.NoError(t, err)
+	actionRepo.On("ListActions", mock.Anything, mock.Anything).Return([]*models.Run{{
+		Project: "p",
+		Domain:  "d",
+		RunName: "run-1",
+		Name:    "a0",
+		RunSpec: runSpec,
+	}}, nil).Once()
+
+	got, err := svc.ListRuns(context.Background(), connect.NewRequest(&workflow.ListRunsRequest{
+		ScopeBy: &workflow.ListRunsRequest_ProjectId{ProjectId: &common.ProjectIdentifier{Name: "p", Domain: "d"}},
+		Request: &common.ListRequest{Limit: 10},
+	}))
+	require.NoError(t, err)
+
+	require.Len(t, got.Msg.Runs, 1)
+	assert.Equal(t, map[string]string{"example.com/branch": "feat/x"}, got.Msg.Runs[0].GetAnnotations())
+}
+
 // TestListAndSendAllActionsUsesAscendingSort guards against regressing the
 // default repo sort order leaking into the WatchActions seed path. Children
 // have a later created_at than their parents; if ListActions returns rows in
@@ -987,38 +1014,58 @@ func TestListAndSendAllActionsUsesAscendingSort(t *testing.T) {
 
 func TestGenerateRunName(t *testing.T) {
 	t.Run("starts with r prefix", func(t *testing.T) {
-		name := generateRunName(42)
+		name := generateRunName()
 		assert.True(t, strings.HasPrefix(name, "r"), "run name should start with 'r', got: %s", name)
 	})
 
 	t.Run("has correct length", func(t *testing.T) {
-		name := generateRunName(42)
+		name := generateRunName()
 		assert.Equal(t, runIDLength, len(name))
 	})
 
-	t.Run("different seeds produce different names", func(t *testing.T) {
-		name1 := generateRunName(1)
-		name2 := generateRunName(2)
-		assert.NotEqual(t, name1, name2)
-	})
-
-	t.Run("same seed produces same name", func(t *testing.T) {
-		name1 := generateRunName(12345)
-		name2 := generateRunName(12345)
-		assert.Equal(t, name1, name2)
+	t.Run("uses only the run name alphabet", func(t *testing.T) {
+		for _, c := range generateRunName()[1:] {
+			assert.Contains(t, runNameAlphabet, string(c))
+		}
 	})
 
 	t.Run("generated names pass run name validation", func(t *testing.T) {
-		for seed := int64(0); seed < 100; seed++ {
-			assert.NoError(t, validateRunName(generateRunName(seed)))
+		for i := 0; i < 100; i++ {
+			assert.NoError(t, validateRunName(generateRunName()))
 		}
+	})
+
+	// Concurrent creates used to reseed one shared source with the time and could draw the
+	// same name.
+	t.Run("unique under concurrency", func(t *testing.T) {
+		const goroutines, each = 64, 500
+		var mu sync.Mutex
+		seen := make(map[string]struct{}, goroutines*each)
+		var wg sync.WaitGroup
+		for g := 0; g < goroutines; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				names := make([]string, each)
+				for i := range names {
+					names[i] = generateRunName()
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				for _, n := range names {
+					seen[n] = struct{}{}
+				}
+			}()
+		}
+		wg.Wait()
+		assert.Len(t, seen, goroutines*each)
 	})
 }
 
 func TestConvertRunToProto(t *testing.T) {
 	// Define the test cases as a slice of structs.
 	s := &RunService{}
-	name := generateRunName(int64(0))
+	name := generateRunName()
 	project := "test_project"
 	domain := "test_domain"
 	startTime := timestamppb.New(time.Date(2026, time.March, 24, 9, 0, 0, 0, time.UTC))
@@ -1936,6 +1983,101 @@ func TestCreateRun_RejectsNULLabel(t *testing.T) {
 			Labels: &task.Labels{Values: map[string]string{"k": "a\x00b"}},
 		},
 		Task: &workflow.CreateRunRequest_TaskSpec{TaskSpec: &task.TaskSpec{}},
+	}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
+}
+
+// TestCreateRun_AppliesSettingsMaps verifies settings labels, annotations and env vars
+// reach the enqueued run spec, with the request's own entry winning on a shared key.
+func TestCreateRun_AppliesSettingsMaps(t *testing.T) {
+	actionRepo := &repoMocks.ActionRepo{}
+	taskRepo := &repoMocks.TaskRepo{}
+	actionsClient := actionsconnectmocks.NewActionsServiceClient(t)
+	repo := &repoMocks.Repository{}
+	store := &storageMocks.ComposedProtobufStore{}
+	dataStore := &storage.DataStore{ComposedProtobufStore: store}
+
+	repo.On("ActionRepo").Return(actionRepo)
+	repo.On("TaskRepo").Return(taskRepo)
+
+	entries := func(m map[string]string) *settings.StringMapSetting {
+		return &settings.StringMapSetting{State: stateValue, MapValue: &settings.StringMap{Entries: m}}
+	}
+	svc := &RunService{
+		repo: repo,
+		settingsRepo: settingsRepoWith(t, &settings.Settings{
+			Labels:               entries(map[string]string{"team": "ml"}),
+			Annotations:          entries(map[string]string{"owner": "alice"}),
+			EnvironmentVariables: entries(map[string]string{"LOG_LEVEL": "info", "REGION": "us-east-1"}),
+		}),
+		actionsClient: actionsClient,
+		projectClient: newMockProjectClientAlwaysOK(t),
+		storagePrefix: "s3://flyte-data",
+		dataStore:     dataStore,
+	}
+
+	req := &workflow.CreateRunRequest{
+		Id: &workflow.CreateRunRequest_RunId{
+			RunId: &common.RunIdentifier{Org: "org", Project: "proj", Domain: "dev", Name: "rs-123"},
+		},
+		InputWrapper: &workflow.CreateRunRequest_Inputs{Inputs: &task.Inputs{}},
+		RunSpec: &task.RunSpec{
+			Envs: &task.Envs{Values: []*core.KeyValuePair{{Key: "LOG_LEVEL", Value: "debug"}}},
+		},
+		Task: &workflow.CreateRunRequest_TaskSpec{TaskSpec: &task.TaskSpec{}},
+	}
+
+	store.On("WriteProtobuf", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+	taskRepo.On("CreateTaskSpec", mock.Anything, mock.Anything).Return(nil).Once()
+	actionRepo.On("CreateAction", mock.Anything, mock.MatchedBy(func(m *models.Run) bool {
+		return string(m.Labels) == `{"team":"ml"}`
+	}), mock.Anything).Return(&models.Run{Project: "proj", Domain: "dev", Name: "rs-123"}, nil).Once()
+
+	var got *task.RunSpec
+	actionsClient.On("Enqueue", mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			got = args.Get(1).(*connect.Request[actions.EnqueueRequest]).Msg.GetRunSpec()
+		}).
+		Return(connect.NewResponse(&actions.EnqueueResponse{}), nil).Once()
+
+	_, err := svc.CreateRun(context.Background(), connect.NewRequest(req))
+	require.NoError(t, err)
+	actionRepo.AssertExpectations(t)
+
+	assert.Equal(t, map[string]string{"team": "ml"}, got.GetLabels().GetValues())
+	assert.Equal(t, map[string]string{"owner": "alice"}, got.GetAnnotations().GetValues())
+	assert.True(t, proto.Equal(envs("LOG_LEVEL", "debug", "REGION", "us-east-1"), got.GetEnvs()),
+		"envs: got %v", got.GetEnvs())
+}
+
+// TestCreateRun_RejectsNULLabelFromSettings verifies settings labels go through the same
+// label check as the request's own.
+func TestCreateRun_RejectsNULLabelFromSettings(t *testing.T) {
+	actionRepo := &repoMocks.ActionRepo{} // no expectations: any CreateAction call fails the test
+	repo := &repoMocks.Repository{}
+	repo.On("ActionRepo").Maybe().Return(actionRepo)
+	repo.On("TaskRepo").Maybe().Return(&repoMocks.TaskRepo{})
+	t.Cleanup(func() { actionRepo.AssertExpectations(t) })
+
+	svc := &RunService{
+		repo: repo,
+		settingsRepo: settingsRepoWith(t, &settings.Settings{
+			Labels: &settings.StringMapSetting{
+				State:    stateValue,
+				MapValue: &settings.StringMap{Entries: map[string]string{"k": "a\x00b"}},
+			},
+		}),
+		projectClient: newMockProjectClientAlwaysOK(t),
+		storagePrefix: "s3://flyte-data",
+	}
+
+	_, err := svc.CreateRun(context.Background(), connect.NewRequest(&workflow.CreateRunRequest{
+		Id: &workflow.CreateRunRequest_RunId{
+			RunId: &common.RunIdentifier{Org: "org", Project: "proj", Domain: "dev", Name: "rs-nul"},
+		},
+		InputWrapper: &workflow.CreateRunRequest_Inputs{Inputs: &task.Inputs{}},
+		Task:         &workflow.CreateRunRequest_TaskSpec{TaskSpec: &task.TaskSpec{}},
 	}))
 	require.Error(t, err)
 	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))

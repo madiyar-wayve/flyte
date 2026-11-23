@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"connectrpc.com/connect"
@@ -289,4 +290,157 @@ func TestEnqueue_NoTemplateUsesDefaultNamespace(t *testing.T) {
 	root, err := c.GetTaskAction(ctx, &common.ActionIdentifier{Run: runID, Name: runID.Name})
 	require.NoError(t, err)
 	assert.Equal(t, "flyte", root.Namespace)
+}
+
+// Reconstruct the client to prove that finding old namespaces does not depend
+// on an in-memory cache retained across a deployment.
+func TestNamespaceMappingChangePreservesInFlightRun(t *testing.T) {
+	for _, template := range []string{"v2-{{ project }}-{{ domain }}", ""} {
+		t.Run(template, func(t *testing.T) {
+			ctx := context.Background()
+			original := newMappedClient(t, true)
+			runID := mappedRunID("flytesnacks")
+			rootID := &common.ActionIdentifier{Run: runID, Name: runID.Name}
+			require.NoError(t, original.Enqueue(ctx, newTask(runID, runID.Name, nil), nil))
+			restarted := &ActionsClient{
+				namespace: "flyte", namespaceTemplate: template,
+				k8sClient: original.k8sClient, sharedCache: original.sharedCache,
+			}
+			root, err := restarted.GetTaskAction(ctx, rootID)
+			require.NoError(t, err)
+			assert.Equal(t, "flytesnacks-development", root.Namespace)
+			parent := runID.Name
+			require.NoError(t, restarted.Enqueue(ctx, newTask(runID, "a1", &parent), nil))
+			childID := &common.ActionIdentifier{Run: runID, Name: "a1"}
+			child, err := restarted.GetTaskAction(ctx, childID)
+			require.NoError(t, err)
+			assert.Equal(t, root.Namespace, child.Namespace)
+			require.NoError(t, restarted.PutStatus(ctx, childID, 1, &workflow.ActionStatus{Attempts: 1}, nil))
+			children, err := restarted.ListChildActions(ctx, rootID)
+			require.NoError(t, err)
+			assert.Len(t, children, 2)
+			all, err := restarted.listRunTaskActions(ctx, runID)
+			require.NoError(t, err)
+			assert.Len(t, all, 2)
+			err = restarted.Enqueue(ctx, newTask(runID, runID.Name, nil), nil)
+			assert.Equal(t, connect.CodeAlreadyExists, connect.CodeOf(err))
+			require.NoError(t, restarted.AbortAction(ctx, childID, nil))
+			require.NoError(t, restarted.AbortAction(ctx, rootID, nil))
+		})
+	}
+}
+
+func TestMappedNamespaceChecksRunOwnership(t *testing.T) {
+	for _, dimension := range []string{"project", "domain"} {
+		t.Run(dimension, func(t *testing.T) {
+			ctx := context.Background()
+			c := newMappedClient(t, true)
+			c.namespaceTemplate = "shared"
+			runA, runB := mappedRunID("proj-a"), mappedRunID("proj-a")
+			if dimension == "project" {
+				runB.Project = "proj-b"
+			} else {
+				runB.Domain = "production"
+			}
+			require.NoError(t, c.Enqueue(ctx, newTask(runA, runA.Name, nil), nil))
+			rootB := &common.ActionIdentifier{Run: runB, Name: runB.Name}
+			_, err := c.GetTaskAction(ctx, rootB)
+			assert.True(t, apierrors.IsNotFound(err), "got %v", err)
+			assert.Error(t, c.AbortAction(ctx, rootB, nil))
+			assert.Error(t, c.PutStatus(ctx, rootB, 1, &workflow.ActionStatus{Attempts: 1}, nil))
+			children, err := c.ListChildActions(ctx, rootB)
+			require.NoError(t, err)
+			assert.Empty(t, children)
+			parent := runB.Name
+			assert.Error(t, c.Enqueue(ctx, newTask(runB, "a1", &parent), nil))
+			err = c.Enqueue(ctx, newTask(runB, runB.Name, nil), nil)
+			assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err), "a colliding name must not be treated as this run already launching")
+			_, err = c.GetTaskAction(ctx, &common.ActionIdentifier{Run: runA, Name: runA.Name})
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestEnqueue_RecreatesDeletedCachedNamespace(t *testing.T) {
+	ctx := context.Background()
+	c := newMappedClientWithFuncs(t, true, interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*executorv1.TaskAction); ok {
+				// The fake client does not enforce namespace existence itself.
+				if err := cl.Get(ctx, client.ObjectKey{Name: obj.GetNamespace()}, &corev1.Namespace{}); err != nil {
+					return err
+				}
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+	runID := mappedRunID("flytesnacks")
+	require.NoError(t, c.Enqueue(ctx, newTask(runID, runID.Name, nil), nil))
+	require.NoError(t, c.k8sClient.Delete(ctx, namespaceObj("flytesnacks-development")))
+	runID = &common.RunIdentifier{Project: runID.Project, Domain: runID.Domain, Name: "run2"}
+	require.NoError(t, c.Enqueue(ctx, newTask(runID, runID.Name, nil), nil))
+	require.NoError(t, c.k8sClient.Get(ctx, client.ObjectKey{Name: "flytesnacks-development"}, &corev1.Namespace{}))
+}
+
+func TestEnqueue_TerminatingNamespaceFailsRun(t *testing.T) {
+	for _, create := range []bool{true, false} {
+		t.Run(fmt.Sprint(create), func(t *testing.T) {
+			ctx := context.Background()
+			ns := namespaceObj("flytesnacks-development")
+			ns.Status.Phase = corev1.NamespaceTerminating
+			c := newMappedClient(t, create, ns)
+			runID := mappedRunID("flytesnacks")
+			err := c.Enqueue(ctx, newTask(runID, runID.Name, nil), nil)
+			assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
+			assert.ErrorContains(t, err, "terminating")
+		})
+	}
+}
+
+func TestEnqueue_CachedTerminatingNamespaceFailsRun(t *testing.T) {
+	ctx := context.Background()
+	c := newMappedClientWithFuncs(t, true, interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*executorv1.TaskAction); ok {
+				err := apierrors.NewForbidden(schema.GroupResource{Resource: "taskactions"}, obj.GetName(), fmt.Errorf("namespace is terminating"))
+				err.ErrStatus.Details.Causes = []metav1.StatusCause{{Type: corev1.NamespaceTerminatingCause}}
+				return err
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+	c.knownNamespaces.Store("flytesnacks-development", struct{}{})
+	runID := mappedRunID("flytesnacks")
+	err := c.Enqueue(ctx, newTask(runID, runID.Name, nil), nil)
+	assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
+	_, cached := c.knownNamespaces.Load("flytesnacks-development")
+	assert.False(t, cached)
+}
+
+func TestNamespaceRecoveryIsBounded(t *testing.T) {
+	ctx := context.Background()
+	creates := 0
+	c := newMappedClientWithFuncs(t, true, interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*executorv1.TaskAction); ok {
+				creates++
+				return apierrors.NewNotFound(schema.GroupResource{Resource: "namespaces"}, obj.GetNamespace())
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+	runID := mappedRunID("flytesnacks")
+	err := c.Enqueue(ctx, newTask(runID, runID.Name, nil), nil)
+	assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
+	assert.Equal(t, 2, creates, "only one retry is allowed")
+}
+
+func TestHistoricalNamespaceLookupRejectsAmbiguity(t *testing.T) {
+	runID := mappedRunID("flytesnacks")
+	a, b := legacyRoot(runID), legacyRoot(runID)
+	a.Namespace, b.Namespace = "old-a", "old-b"
+	c := newMappedClient(t, true, a, b)
+	_, err := c.GetTaskAction(context.Background(), &common.ActionIdentifier{Run: runID, Name: runID.Name})
+	assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
+	assert.ErrorContains(t, err, "multiple namespaces")
 }

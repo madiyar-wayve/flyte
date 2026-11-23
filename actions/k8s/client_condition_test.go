@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric/noop"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	corev1 "k8s.io/api/core/v1"
@@ -20,7 +21,6 @@ import (
 
 	executorv1 "github.com/flyteorg/flyte/v2/executor/api/v1"
 	"github.com/flyteorg/flyte/v2/flytestdlib/fastcheck"
-	"github.com/flyteorg/flyte/v2/flytestdlib/promutils"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/actions"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/common"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core"
@@ -35,7 +35,9 @@ func newConditionClient(t *testing.T) *ActionsClient {
 	require.NoError(t, corev1.AddToScheme(scheme)) // EnsureNamespaceExists needs v1.Namespace
 	require.NoError(t, executorv1.AddToScheme(scheme))
 	parent := &executorv1.TaskAction{
-		ObjectMeta: metav1.ObjectMeta{Name: "run1-a0", Namespace: "flyte"},
+		ObjectMeta: metav1.ObjectMeta{Name: "run1-a0", Namespace: "flyte", Labels: map[string]string{
+			"flyte.org/project": "proj", "flyte.org/domain": "dev", "flyte.org/run": "run1",
+		}},
 	}
 	return &ActionsClient{
 		recordedFilter: testFilter(),
@@ -259,7 +261,7 @@ func TestNotifyRunService_Condition(t *testing.T) {
 		// the dedup filter so notifyRunService skips RecordAction and only issues
 		// the status update (the coalescing gate records on first sight of any
 		// non-delete event, deduped via this filter).
-		filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+		filter, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 		require.NoError(t, err)
 		c.recordedFilter = filter
 		c.recordedFilter.Add(ctx, recordedFilterKey(ta))

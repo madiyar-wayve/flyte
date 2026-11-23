@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric/noop"
 	"google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
@@ -25,7 +26,6 @@ import (
 
 	executorv1 "github.com/flyteorg/flyte/v2/executor/api/v1"
 	"github.com/flyteorg/flyte/v2/flytestdlib/fastcheck"
-	"github.com/flyteorg/flyte/v2/flytestdlib/promutils"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/actions"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/common"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core"
@@ -62,7 +62,7 @@ func TestNotifyRunService_DeduplicateRecordAction(t *testing.T) {
 
 	mockClient := runmocks.NewInternalRunServiceClient(t)
 
-	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	filter, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 	assert.NoError(t, err)
 
 	c := &ActionsClient{
@@ -91,7 +91,7 @@ func TestNotifyRunService_FailedRecordAllowsRetry(t *testing.T) {
 
 	mockClient := runmocks.NewInternalRunServiceClient(t)
 
-	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	filter, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 	assert.NoError(t, err)
 
 	c := &ActionsClient{
@@ -280,7 +280,8 @@ func TestEmbedTaskTemplate_SubstitutesRunStartTime(t *testing.T) {
 
 	embedded := func(action *actions.Action) *core.TaskTemplate {
 		ta := &executorv1.TaskAction{Spec: executorv1.TaskActionSpec{}}
-		require.NoError(t, embedTaskTemplate(action, ta, &task.RunSpec{RunStartTime: timestamppb.New(startTime)}))
+		applyRunSpecToTaskAction(ta, &task.RunSpec{RunStartTime: timestamppb.New(startTime)})
+		require.NoError(t, embedTaskTemplate(action, ta))
 		out := &core.TaskTemplate{}
 		require.NoError(t, proto.Unmarshal(ta.Spec.TaskTemplate, out))
 		return out
@@ -299,7 +300,7 @@ func TestEmbedTaskTemplate_SubstitutesRunStartTime(t *testing.T) {
 
 	t.Run("no-op when run start time is unset", func(t *testing.T) {
 		ta := &executorv1.TaskAction{Spec: executorv1.TaskActionSpec{}}
-		require.NoError(t, embedTaskTemplate(newAction(), ta, &task.RunSpec{}))
+		require.NoError(t, embedTaskTemplate(newAction(), ta))
 		out := &core.TaskTemplate{}
 		require.NoError(t, proto.Unmarshal(ta.Spec.TaskTemplate, out))
 		assert.Equal(t, runStartTimeTemplateVar, out.GetContainer().GetArgs()[2])
@@ -356,6 +357,9 @@ func TestApplyRunSpecToTaskAction_ProjectsRuntimeSettings(t *testing.T) {
 		DefaultSettings: &task.DefaultSettings{
 			PodTemplateName: "gpu-template",
 		},
+		SecurityContext: &core.SecurityContext{
+			RunAs: &core.Identity{K8SServiceAccount: "run-sa"},
+		},
 	})
 
 	require.NotNil(t, taskAction.Spec.Interruptible)
@@ -367,6 +371,21 @@ func TestApplyRunSpecToTaskAction_ProjectsRuntimeSettings(t *testing.T) {
 	assert.Equal(t, "platform", taskAction.Labels["team"])
 	assert.Equal(t, "sdk", taskAction.Annotations["owner"])
 	assert.Equal(t, "gpu-template", taskAction.Spec.PodTemplateName)
+	assert.Equal(t, "run-sa", taskAction.Spec.ServiceAccount)
+}
+
+func TestApplyRunSpecToTaskAction_ServiceAccount(t *testing.T) {
+	t.Run("unset service account stays empty", func(t *testing.T) {
+		ta := &executorv1.TaskAction{}
+		applyRunSpecToTaskAction(ta, &task.RunSpec{})
+		assert.Empty(t, ta.Spec.ServiceAccount)
+	})
+
+	t.Run("nil run spec clears a stale service account", func(t *testing.T) {
+		ta := &executorv1.TaskAction{Spec: executorv1.TaskActionSpec{ServiceAccount: "stale-sa"}}
+		applyRunSpecToTaskAction(ta, nil)
+		assert.Empty(t, ta.Spec.ServiceAccount)
+	})
 }
 
 func TestApplyRunSpecToTaskAction_RawDataPrefix(t *testing.T) {
@@ -401,6 +420,7 @@ func TestInheritRunContextFromParentTaskAction(t *testing.T) {
 			},
 			Interruptible:   &interruptible,
 			PodTemplateName: "gpu-template",
+			ServiceAccount:  "run-sa",
 			RawDataPrefix:   "s3://raw-bucket/prefix",
 		},
 	}
@@ -424,6 +444,7 @@ func TestInheritRunContextFromParentTaskAction(t *testing.T) {
 	assert.Equal(t, "run1", child.Labels["flyte.org/run"])
 	assert.Equal(t, "sdk", child.Annotations["owner"])
 	assert.Equal(t, "gpu-template", child.Spec.PodTemplateName)
+	assert.Equal(t, "run-sa", child.Spec.ServiceAccount)
 
 	// Verify deep copy (child mutation must not mutate parent map).
 	child.Spec.EnvVars["TRACE_ID"] = "mutated"
@@ -542,7 +563,7 @@ func TestEmbedTaskTemplate_StampsPodTemplateName(t *testing.T) {
 
 	embedded := func(action *actions.Action, name string) *core.TaskTemplate {
 		ta := &executorv1.TaskAction{Spec: executorv1.TaskActionSpec{PodTemplateName: name}}
-		require.NoError(t, embedTaskTemplate(action, ta, &task.RunSpec{}))
+		require.NoError(t, embedTaskTemplate(action, ta))
 		out := &core.TaskTemplate{}
 		require.NoError(t, proto.Unmarshal(ta.Spec.TaskTemplate, out))
 		return out
@@ -562,11 +583,70 @@ func TestEmbedTaskTemplate_StampsPodTemplateName(t *testing.T) {
 	})
 }
 
+func TestApplyServiceAccount(t *testing.T) {
+	sa := func(tmpl *core.TaskTemplate) string {
+		return tmpl.GetSecurityContext().GetRunAs().GetK8SServiceAccount()
+	}
+
+	t.Run("stamps a task that sets none", func(t *testing.T) {
+		got := applyServiceAccount(&core.TaskTemplate{}, "run-sa")
+		assert.Equal(t, "run-sa", sa(got))
+	})
+
+	t.Run("the task's own service account wins", func(t *testing.T) {
+		tmpl := &core.TaskTemplate{SecurityContext: &core.SecurityContext{
+			RunAs: &core.Identity{K8SServiceAccount: "task-sa"},
+		}}
+		got := applyServiceAccount(tmpl, "run-sa")
+		assert.Equal(t, "task-sa", sa(got))
+		assert.Same(t, tmpl, got)
+	})
+
+	t.Run("empty name is a no-op", func(t *testing.T) {
+		tmpl := &core.TaskTemplate{}
+		got := applyServiceAccount(tmpl, "")
+		assert.Same(t, tmpl, got)
+		assert.Nil(t, got.GetSecurityContext())
+	})
+
+	t.Run("keeps the other security context fields", func(t *testing.T) {
+		tmpl := &core.TaskTemplate{SecurityContext: &core.SecurityContext{
+			RunAs:   &core.Identity{IamRole: "arn:aws:iam::123:role/task"},
+			Secrets: []*core.Secret{{Key: "token"}},
+		}}
+		got := applyServiceAccount(tmpl, "run-sa")
+		assert.Equal(t, "run-sa", sa(got))
+		assert.Equal(t, "arn:aws:iam::123:role/task", got.GetSecurityContext().GetRunAs().GetIamRole())
+		assert.Len(t, got.GetSecurityContext().GetSecrets(), 1)
+		// The caller's proto must be left untouched (it is persisted separately as the task spec).
+		assert.Empty(t, sa(tmpl))
+	})
+}
+
+func TestEmbedTaskTemplate_StampsServiceAccount(t *testing.T) {
+	action := &actions.Action{
+		Spec: &actions.Action_Task{
+			Task: &workflow.TaskAction{
+				Spec: &task.TaskSpec{
+					TaskTemplate: &core.TaskTemplate{Type: "python"},
+				},
+			},
+		},
+	}
+	ta := &executorv1.TaskAction{Spec: executorv1.TaskActionSpec{ServiceAccount: "run-sa"}}
+	require.NoError(t, embedTaskTemplate(action, ta))
+
+	out := &core.TaskTemplate{}
+	require.NoError(t, proto.Unmarshal(ta.Spec.TaskTemplate, out))
+	assert.Equal(t, "run-sa", out.GetSecurityContext().GetRunAs().GetK8SServiceAccount())
+	assert.Nil(t, action.GetSpec().(*actions.Action_Task).Task.Spec.TaskTemplate.GetSecurityContext())
+}
+
 func TestNotifyRunService_SkipsTerminalAddedEventsOnlyWhenInBloomFilter(t *testing.T) {
 	ctx := context.Background()
 
 	mockClient := runmocks.NewInternalRunServiceClient(t)
-	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	filter, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 	require.NoError(t, err)
 
 	c := &ActionsClient{
@@ -621,7 +701,7 @@ func TestNotifyRunService_ProcessesNonTerminalAddedEvents(t *testing.T) {
 	ctx := context.Background()
 
 	mockClient := runmocks.NewInternalRunServiceClient(t)
-	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	filter, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 	require.NoError(t, err)
 
 	c := &ActionsClient{
@@ -668,7 +748,7 @@ func TestNotifyRunService_DuplicateAddedSkipsRecordAction(t *testing.T) {
 	ctx := context.Background()
 
 	mockClient := runmocks.NewInternalRunServiceClient(t)
-	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	filter, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 	require.NoError(t, err)
 
 	c := &ActionsClient{
@@ -698,7 +778,7 @@ func TestNotifyRunService_TerminalDuplicateRepairsTimestamps(t *testing.T) {
 	ctx := context.Background()
 
 	mockClient := runmocks.NewInternalRunServiceClient(t)
-	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	filter, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 	require.NoError(t, err)
 
 	c := &ActionsClient{
@@ -852,7 +932,7 @@ func runningTaskAction(name string) *executorv1.TaskAction {
 func TestHandleWatchEvent_CoalescedReadsLatestPhase(t *testing.T) {
 	ctx := context.Background()
 	mockClient := runmocks.NewInternalRunServiceClient(t)
-	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	filter, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 	require.NoError(t, err)
 
 	c := &ActionsClient{
@@ -889,7 +969,7 @@ func TestHandleWatchEvent_CoalescedReadsLatestPhase(t *testing.T) {
 func TestHandleWatchEvent_CreateThenDeleteStillRecords(t *testing.T) {
 	ctx := context.Background()
 	mockClient := runmocks.NewInternalRunServiceClient(t)
-	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	filter, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 	require.NoError(t, err)
 
 	c := &ActionsClient{
@@ -918,6 +998,7 @@ func TestHandleWatchEvent_CreateThenDeleteStillRecords(t *testing.T) {
 	})).Return(&connect.Response[workflow.UpdateActionStatusResponse]{}, nil).Once()
 
 	c.handleWatchEvent(ctx, watch.Event{Type: watch.Deleted, Object: runningTaskAction("d1")})
+	assert.False(t, filter.Contains(ctx, []byte(buildTaskActionName(buildActionUpdate(ctx, runningTaskAction("d1"), watch.Deleted).ActionID))))
 
 	mockClient.AssertNumberOfCalls(t, "RecordAction", 1)
 	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 1)
@@ -929,7 +1010,7 @@ func TestHandleWatchEvent_CreateThenDeleteStillRecords(t *testing.T) {
 func TestHandleWatchEvent_DeleteAfterRecordDoesNotDoubleRecord(t *testing.T) {
 	ctx := context.Background()
 	mockClient := runmocks.NewInternalRunServiceClient(t)
-	filter, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	filter, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 	require.NoError(t, err)
 
 	c := &ActionsClient{
@@ -945,9 +1026,34 @@ func TestHandleWatchEvent_DeleteAfterRecordDoesNotDoubleRecord(t *testing.T) {
 		Return(&connect.Response[workflow.UpdateActionStatusResponse]{}, nil).Once()
 
 	c.handleTaskActionEvent(ctx, runningTaskAction("d2"), watch.Deleted)
+	assert.False(t, filter.Contains(ctx, []byte(buildTaskActionName(buildActionUpdate(ctx, runningTaskAction("d2"), watch.Deleted).ActionID))))
 
 	mockClient.AssertNotCalled(t, "RecordAction")
 	mockClient.AssertNumberOfCalls(t, "UpdateActionStatus", 1)
+}
+
+func TestHandleWatchEvent_LabelledDeleteOnlyRemovesFilterEntry(t *testing.T) {
+	ctx := context.Background()
+	mockClient := runmocks.NewInternalRunServiceClient(t)
+	filter := testFilter()
+	ta := runningTaskAction("deleted")
+	parent := "a0"
+	ta.Spec.ParentActionName = &parent
+	ta.Labels = map[string]string{labelTerminalStatusRecorded: "true"}
+	key := []byte(buildTaskActionName(buildActionUpdate(ctx, ta, watch.Deleted).ActionID))
+	filter.Add(ctx, key)
+	c := &ActionsClient{
+		runClient:      mockClient,
+		recordedFilter: filter,
+		bufferSize:     10,
+		subscribers:    make(map[string]map[chan *ActionUpdate]struct{}),
+	}
+	ch := c.Subscribe(&common.RunIdentifier{Project: "p", Domain: "d", Name: "run1"}, parent)
+	c.handleWatchEvent(ctx, watch.Event{Type: watch.Deleted, Object: ta})
+	assert.False(t, filter.Contains(ctx, key))
+	assert.Empty(t, ch, "already-recorded deletions must not notify subscribers")
+	mockClient.AssertNotCalled(t, "RecordAction")
+	mockClient.AssertNotCalled(t, "UpdateActionStatus")
 }
 
 // With several actions replicas, another replica can record the terminal status and
@@ -1190,26 +1296,24 @@ func TestBuildActionUpdate_DeleteOnNonTerminalForcesAborted(t *testing.T) {
 // real client (constructed via NewActionsClient); struct-literal test clients must
 // set it too, otherwise notifyRunService's RecordAction path nil-derefs.
 func testFilter() fastcheck.Filter {
-	f, err := fastcheck.NewOppoBloomFilter(128, promutils.NewTestScope())
+	f, err := fastcheck.NewOppoBloomFilter(128, "test", noop.NewMeterProvider())
 	if err != nil {
 		panic(err)
 	}
 	return f
 }
 
-func TestNewActionsClient_FilterSizeValidation(t *testing.T) {
-	// The dedup filter is mandatory, so recordFilterSize must be positive.
-	// Both negative and zero are rejected.
-	_, err := NewActionsClient(nil, nil, "ns", 10, 1, nil, -1, promutils.NewTestScope(), "", true)
-	require.Error(t, err)
+func TestNewActionsClient_FilterDependency(t *testing.T) {
+	c, err := NewActionsClient(nil, nil, "ns", 10, 1, nil, nil, "", true)
+	require.ErrorContains(t, err, "dedup filter is required")
+	require.Nil(t, c)
 
-	_, err = NewActionsClient(nil, nil, "ns", 10, 1, nil, 0, promutils.NewTestScope(), "", true)
-	require.Error(t, err)
-
-	// A positive size builds the mandatory filter.
-	c, err := NewActionsClient(nil, nil, "ns", 10, 1, nil, 128, promutils.NewTestScope(), "", true)
+	// The client accepts any Filter implementation and preserves the supplied instance.
+	filter, err := fastcheck.NewLRUCacheFilter(128, "test", noop.NewMeterProvider())
 	require.NoError(t, err)
-	require.NotNil(t, c.recordedFilter)
+	c, err = NewActionsClient(nil, nil, "ns", 10, 1, nil, filter, "", true)
+	require.NoError(t, err)
+	require.Same(t, filter, c.recordedFilter)
 }
 
 // Only cache reads are available; the ActionsClient has no API client to fall back to.
@@ -1235,8 +1339,10 @@ func TestListChildActions_IndexedCache(t *testing.T) {
 	parentID := &common.ActionIdentifier{Run: &common.RunIdentifier{Project: "proj", Domain: "dev", Name: "run1"}, Name: "a0"}
 	create := func(name, parent, project, domain, run, namespace string) *executorv1.TaskAction {
 		ta := &executorv1.TaskAction{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-			Spec:       executorv1.TaskActionSpec{Project: project, Domain: domain, RunName: run, ActionName: name},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: map[string]string{
+				"flyte.org/project": project, "flyte.org/domain": domain, "flyte.org/run": run,
+			}},
+			Spec: executorv1.TaskActionSpec{Project: project, Domain: domain, RunName: run, ActionName: name},
 		}
 		if parent != "" {
 			ta.Spec.ParentActionName = &parent
